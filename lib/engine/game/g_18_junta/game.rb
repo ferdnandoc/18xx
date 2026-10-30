@@ -5,9 +5,13 @@ require_relative 'map'
 require_relative 'meta'
 require_relative 'player'
 require_relative 'stock_market'
+require_relative 'step/buy_sell_par_shares'
 require_relative 'step/dividend'
+require_relative 'step/fix_par_price'
 require_relative 'step/paramilitary_choice'
 require_relative 'step/private_auction'
+require_relative 'step/private_m_draw'
+require_relative 'step/special_choose'
 require_relative 'step/track'
 require_relative 'step/upgrade_license'
 require_relative '../base'
@@ -157,6 +161,12 @@ module Engine
         POLITICAL_TRACK_LIMIT = 5
         RADICAL_THRESHOLD = 3
 
+        # Rules summary 6.5: under Dictatorship, each Military-aligned company receives $80 per token.
+        MILITARY_BONUS_PER_TOKEN = 80
+
+        # Rules summary 11 (E): what the bank gives the company Casa Ruiz de Assistencia is donated to.
+        PRIVATE_E_DONATION = 150
+
         # Rules summary 6.2: hexes with a paramilitary token.
         PARAMILITARY_HEXES = %w[B14 C11 E7 F4 G13 I3 I9 K11 L8].freeze
 
@@ -181,6 +191,12 @@ module Engine
           remove_random_corporation!
           select_random_privates!
           setup_political_track!
+          # Rules summary 1.5: two Calm cards and one Coup Attempt card, shuffled.
+          @political_situation_deck = %i[calm calm coup].sort_by { rand }
+          @coup_outcome = nil
+          @private_a_used = false
+          @fixed_par_prices = {}
+          @private_m_used_turn = nil
         end
 
         # Rules summary 1.2: one public company, drawn at random, is out of the game. Its home
@@ -254,11 +270,14 @@ module Engine
         end
 
         def stock_round
+          # PrivateMDraw is a free action, so it stays first: it never blocks the Private (A) question.
           Round::Stock.new(self, [
+            G18Junta::Step::PrivateMDraw,
+            G18Junta::Step::FixParPrice,
             Engine::Step::DiscardTrain,
             Engine::Step::Exchange,
             Engine::Step::SpecialTrack,
-            Engine::Step::BuySellParShares,
+            G18Junta::Step::BuySellParShares,
           ])
         end
 
@@ -270,6 +289,7 @@ module Engine
             Engine::Step::Bankrupt,
             Engine::Step::Exchange,
             Engine::Step::SpecialTrack,
+            G18Junta::Step::SpecialChoose,
             Engine::Step::BuyCompany,
             G18Junta::Step::ParamilitaryChoice,
             G18Junta::Step::Track,
@@ -329,6 +349,8 @@ module Engine
           status << "Civilian tokens: #{alignment[:civilian]}" if alignment[:civilian].positive?
           status << "Military tokens: #{alignment[:military]}" if alignment[:military].positive?
           status << 'Upgrade License acquired' if upgrade_license_granted?(corporation)
+          fixed = fixed_par_price_for(corporation)
+          status << "Par price fixed at #{format_currency(fixed.price)}" if fixed && !corporation.ipoed
           status unless status.empty?
         end
 
@@ -347,9 +369,28 @@ module Engine
         end
 
         # Farms are shown as a single symbol in the route text.
+        # Towns that Expresso Resplandor (G) leaves out of the train range are shown in brackets.
         def revenue_str(route)
           farm_hexes = route.visited_stops.select { |stop| farm_stop?(stop) }.map(&:hex)
-          route.hexes.map { |hex| farm_hexes.include?(hex) ? 'Ⓕ' : hex.name }.join('+')
+          free_towns = owns_private?(route.corporation, '(G)') ? route.visited_stops.select(&:town?).map(&:hex) : []
+          route.hexes.map do |hex|
+            next 'Ⓕ' if farm_hexes.include?(hex)
+
+            free_towns.include?(hex) ? "[#{hex.name}]" : hex.name
+          end.join('+')
+        end
+
+        # Rules summary 11 (G): towns do not count toward the range of the owning company's trains.
+        def check_distance(route, visits, train = nil)
+          train ||= route.train
+          return super if !train.distance.is_a?(Numeric) || !owns_private?(route.corporation, '(G)')
+
+          distance = visits.sum { |visit| visit.town? ? 0 : visit.visit_cost }
+          raise RouteTooLong, "#{distance} is too many stops for #{train.distance} train" if distance > train.distance
+        end
+
+        def owns_private?(corporation, sym)
+          corporation&.companies&.any? { |company| company.sym == sym }
         end
 
         # Rules summary 7.3: the yellow Laguna tile (J16) upgrades straight to its gray tile (J17), once
@@ -364,8 +405,10 @@ module Engine
         # added to the corruption bag.
         def buy_train(operator, train, price = nil)
           last_of_type = @depot.upcoming.include?(train) && @depot.upcoming.count { |t| t.name == train.name } == 1
+          from_depot = @depot.upcoming.include?(train)
           super
           refill_corruption_bag!(train.name) if last_of_type
+          reveal_political_situation_card! if train.name == '5' && from_depot && !coup_resolved?
         end
 
         def refill_corruption_bag!(train_name)
@@ -390,9 +433,13 @@ module Engine
           @players.sum { |player| player.corruption_tokens.values.sum }
         end
 
-        # Rules summary 9.2: before the coup (next PR), the political track picks the column: Military
-        # uses Dictatorship; Civilian or Neutral uses Democracy.
+        # Rules summary 9.2: the coup outcome picks the column; before the coup, the political track does
+        # (Military: Dictatorship; Civilian or Neutral: Democracy).
         def corruption_penalty_regime
+          @coup_outcome || track_regime
+        end
+
+        def track_regime
           @political_track.negative? ? :dictatorship : :democracy
         end
 
@@ -470,7 +517,7 @@ module Engine
                   "Civilian for #{civilian.map(&:name).join(' and ')}"
         end
 
-        attr_reader :political_track
+        attr_reader :political_track, :coup_outcome
 
         def corporation_alignment(corporation)
           @corporation_alignment[corporation]
@@ -488,6 +535,8 @@ module Engine
         # Rules summary 6.1: one space, or two from space 3 or more on the opposite side; Neutral is
         # skipped and the marker never goes beyond either end.
         def move_political_track!(side)
+          return @log << 'The Political Track is locked after the coup: the marker does not move' if coup_resolved?
+
           direction = side == :civilian ? 1 : -1
           far_on_other_side = -direction * @political_track >= self.class::RADICAL_THRESHOLD
           position = @political_track + (direction * (far_on_other_side ? 2 : 1))
@@ -537,6 +586,203 @@ module Engine
 
           reason = 'supporting a side in a paramilitary hex'
           draw_corruption_token!(corporation.owner, reason) if draw_corruption_token!(corporation.owner, reason) == :white
+        end
+
+        def coup_resolved?
+          !@coup_outcome.nil?
+        end
+
+        # Rules summary 1.5: each 5-train bought from the bank reveals the top card of the deck; the
+        # Coup Attempt card resolves the coup at once.
+        def reveal_political_situation_card!
+          card = @political_situation_deck.shift
+          return @log << 'Political Situation card: Calm' if card == :calm
+
+          @log << 'Political Situation card: Coup Attempt'
+          resolve_coup!
+        end
+
+        # Rules summary 6.3: outcome, token cancellation, regime effects, then closures.
+        def resolve_coup!
+          @coup_outcome = track_regime
+          @log << "The coup ends in #{@coup_outcome.to_s.capitalize}"
+
+          @corporation_alignment.each_value do |alignment|
+            pairs = [alignment[:civilian], alignment[:military]].min
+            alignment[:civilian] -= pairs
+            alignment[:military] -= pairs
+          end
+
+          @coup_outcome == :democracy ? apply_democracy! : apply_dictatorship!
+
+          @companies.dup.each { |company| remove_company(company) }
+          @log << 'All Private Companies close without compensation'
+          @paramilitary_hexes_remaining.clear
+          @log << 'The remaining paramilitary tokens are removed from the board'
+        end
+
+        # Rules summary 6.3: the floated company with the worst balance toward the winning side; ties go
+        # to the higher share price, then to the one that operates first (Corporation#<=>).
+        def least_aligned_corporation(winner)
+          loser = winner == :civilian ? :military : :civilian
+          @corporations.select(&:floated?).min_by do |corporation|
+            alignment = @corporation_alignment[corporation]
+            [alignment[winner] - alignment[loser], corporation]
+          end
+        end
+
+        # Rules summary 6.4: 8-trains leave the game (gray tiles come with the D phase), Civilian
+        # companies move right once per Civilian token, and the least aligned company's share price
+        # drops to the lowest value that is at least half of it.
+        def apply_democracy!
+          remove_trains!('8')
+          @phase.phases.reject! { |phase| phase[:name] == '8' } unless @phase.name == '8'
+          @phase.next_on = Array(@phase.upcoming&.dig(:on))
+
+          @corporations.select(&:floated?).each do |corporation|
+            tokens = @corporation_alignment[corporation][:civilian]
+            next unless tokens.positive?
+
+            old_price = corporation.share_price
+            tokens.times { @stock_market.move_right(corporation) }
+            log_share_price(corporation, old_price)
+          end
+
+          return unless (corporation = least_aligned_corporation(:civilian))
+
+          old_price = corporation.share_price
+          @stock_market.move(corporation, half_share_price(old_price.price).coordinates, force: true)
+          @log << "#{corporation.name} is the least aligned company"
+          log_share_price(corporation, old_price)
+        end
+
+        # Rightmost (then highest) space with the lowest value that is at least half of the price.
+        def half_share_price(price)
+          candidates = @stock_market.market.flatten.compact.select { |sp| sp.price * 2 >= price }
+          lowest = candidates.map(&:price).min
+          candidates.select { |sp| sp.price == lowest }.min_by { |sp| [-sp.coordinates[1], sp.coordinates[0]] }
+        end
+
+        # Rules summary 6.5: D-trains leave the game (so gray tiles never come), the border cities get
+        # fixed military values, Military companies receive $80 per Military token, and the president of
+        # the least aligned company receives 10 black corruption tokens from the stock.
+        def apply_dictatorship!
+          remove_trains!('D')
+
+          self.class::DICTATORSHIP_BORDER_TILES.each do |hex_id, code|
+            hex = hex_by_id(hex_id)
+            tile = Tile.from_code(hex_id, :red, code)
+            tile.location_name = hex.tile.location_name
+            update_tile_lists(tile, hex.tile)
+            hex.lay(tile)
+          end
+          clear_graph
+
+          @corporations.select(&:floated?).each do |corporation|
+            tokens = @corporation_alignment[corporation][:military]
+            next unless tokens.positive?
+
+            amount = tokens * self.class::MILITARY_BONUS_PER_TOKEN
+            @bank.spend(amount, corporation)
+            @log << "#{corporation.name} receives #{format_currency(amount)} for #{tokens} Military tokens"
+          end
+
+          return unless (president = least_aligned_corporation(:military)&.owner)
+
+          president.corruption_tokens[:black] += 10
+          @log << "#{president.name}, president of the least aligned company, receives 10 black corruption tokens"
+        end
+
+        # A copy, so Democracy can drop the 8 phase.
+        def game_phases
+          self.class::PHASES.dup
+        end
+
+        def remove_trains!(name)
+          @depot.upcoming.select { |train| train.name == name }.each { |train| @depot.remove_train(train) }
+          @log << "All #{name}-trains are removed from the game"
+        end
+
+        # Rules summary 11 (A): once per game, the owner of Investidores Unidos fixes the par price of a
+        # company that has not been started (FixParPrice step, at the start of each Stock Round).
+        def private_a_usable_this_stock_round?
+          !@private_a_used
+        end
+
+        def private_a_owner
+          owner = @companies.find { |c| c.sym == '(A)' }&.owner
+          owner if owner&.player?
+        end
+
+        def use_private_a!(corporation, share_price)
+          @private_a_used = true
+          @fixed_par_prices[corporation] = share_price
+          @log << "#{corporation.name} has its par price fixed at #{format_currency(share_price.price)} "\
+                  '(Investidores Unidos)'
+        end
+
+        def skip_private_a!(player)
+          @log << "#{player.name} does not use Investidores Unidos in this Stock Round"
+        end
+
+        def fixed_par_price_for(corporation)
+          @fixed_par_prices[corporation]
+        end
+
+        # Rules summary 11 (E): from the first 3-train, Casa Ruiz de Assistencia may be donated to a
+        # company its owner presides over.
+        def private_e_donatable?(corporation)
+          return false unless corporation&.corporation?
+          return false unless @phase.status.include?('can_buy_companies')
+
+          owner = @companies.find { |c| c.sym == '(E)' }&.owner
+          owner&.player? && corporation.owner == owner
+        end
+
+        def donate_private_e!(corporation)
+          company = @companies.find { |c| c.sym == '(E)' }
+          owner = company.owner
+          owner.companies.delete(company)
+          company.owner = corporation
+          corporation.companies << company
+          @bank.spend(self.class::PRIVATE_E_DONATION, corporation)
+          @log << "#{owner.name} donates #{company.name} to #{corporation.name}, which receives "\
+                  "#{format_currency(self.class::PRIVATE_E_DONATION)} from the bank"
+        end
+
+        # Rules summary 11 (M): once per Stock Round, on the owner's turn, draw a corruption token and
+        # receive $5 times the phase number. The D phase has no number, and an empty bag ends the ability.
+        def private_m_payment
+          5 * @phase.name.to_i
+        end
+
+        def private_m_usable?(player)
+          return false unless player&.player?
+          return false unless @round.is_a?(Engine::Round::Stock)
+          return false if @private_m_used_turn == @turn || @phase.name == 'D' || @corruption_bag.empty?
+
+          @companies.find { |c| c.sym == '(M)' }&.owner == player
+        end
+
+        def use_private_m!(player)
+          raise GameError, 'Sociedade Caja Negra cannot be used now' unless private_m_usable?(player)
+
+          @private_m_used_turn = @turn
+          amount = private_m_payment
+          draw_corruption_token!(player, 'using Sociedade Caja Negra')
+          @bank.spend(amount, player)
+          @log << "#{player.name} receives #{format_currency(amount)} from the bank (Sociedade Caja Negra)"
+        end
+
+        # Rules summary 3.5 and 11 (H): on a high dividend, the bank adds 10% of it to the treasury of the
+        # company that owns Gutiérrez y Asociados.
+        def pay_private_h_bonus!(corporation, revenue)
+          return unless owns_private?(corporation, '(H)')
+
+          bonus = (revenue * 0.1).round
+          @bank.spend(bonus, corporation)
+          @log << "#{corporation.name} receives #{format_currency(bonus)} from the bank for a high dividend "\
+                  '(Gutiérrez y Asociados)'
         end
       end
     end
